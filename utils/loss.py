@@ -91,14 +91,14 @@ def masked_ce_dc(outputs, label, mask):
     return loss_ce + loss_dc
 
 class DeepInfoMaxLoss(nn.Module): #互信息最大化损失
-    def __init__(self, type="concat"):
+    def __init__(self, num_classes, type="concat"):
         super().__init__()
         if type=="concat":
             self.global_d = GlobalDiscriminator(sz=64+64)#
         elif type=="dot":
             self.global_d = GlobalDiscriminatorDot(sz=64)
         elif type=="conv":
-            self.global_d = GlobalDiscriminatorConv(sz=7+7)
+            self.global_d = GlobalDiscriminatorConv(sz=num_classes+num_classes)
 
     def forward(self, proto_label_pos, proto_label_neg, proto_unlabel_pos):
         Ej = -F.softplus(-self.global_d(proto_unlabel_pos, proto_label_pos)).mean() #pos pair

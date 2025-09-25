@@ -1,11 +1,12 @@
 import sys
-sys.path.append('/home/data/hq/DA')
-
+sys.path.append('/home/chenxu/github/UDA-MIMA')
+import pdb
 import time
 import argparse
 import os
 import shutil
 import numpy as np
+import numpy
 import nibabel as nib
 import torch
 import torch.nn as nn
@@ -16,18 +17,19 @@ import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import scipy.misc
 import random
-from build_dataset import build_dataset_DA, build_dataset_DA_ca
+#from build_dataset import build_dataset_DA, build_dataset_DA_ca
 from models.layers import conv_block, up_conv
 from utils.metrics import MHDValue, DiceScore
 from utils.loss import dice_loss, DiceLoss, DeepInfoMaxLoss
 from utils.utils import set_requires_grad, load_pretrained, setup_seed
 from utils.transforms import random_flip_rotate
 from utils.fft import FDA_source_to_target
-from experiment_config import EXPERIMENTS,EXPERIMENTS_m
+#from experiment_config import EXPERIMENTS,EXPERIMENTS_m
 import platform
 
 from runx.logx import logx
 from einops import rearrange,reduce
+import ADA_native
 
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter(comment='MI')
@@ -228,25 +230,26 @@ def soft_label_cross_entropy(pred, soft_label, pixel_weights=None):
 class Criterion(nn.Module):
     def __init__(self, num_classes, ignore_index=255):
         super(Criterion, self).__init__()
-        self.sce_loss = SymmetricCrossEntropyLoss(ignore_index=ignore_index)
+        self.sce_loss = SymmetricCrossEntropyLoss(num_classes, ignore_index=ignore_index)
         self.dice_loss = DiceLoss(num_classes, ignore_index=ignore_index)
 
     def forward(self, logits, label, alpha, beta):
         return self.sce_loss(logits, label, alpha, beta) + self.dice_loss(logits, label)
 
 
-def symmetric_cross_entropy(logits, label, alpha=1, beta=1):
+def symmetric_cross_entropy(logits, label, num_classes, alpha=1, beta=1):
     ce_loss = F.cross_entropy(logits, label)
     pred = torch.softmax(logits, dim=1)
-    label_one_hot = to_one_hot(label, 7)
+    label_one_hot = to_one_hot(label, num_classes)
     label_one_hot = torch.clamp(label_one_hot.float(), min=1e-4, max=1.0)
     rce_loss = torch.mean(torch.sum(-pred * torch.log(label_one_hot), dim=1))
     return alpha * ce_loss + beta * rce_loss
 
 
 class SymmetricCrossEntropyLoss(nn.Module):
-    def __init__(self, ignore_index=255):
+    def __init__(self, num_classes, ignore_index=255):
         super(SymmetricCrossEntropyLoss, self).__init__()
+        self.num_classes = num_classes
         self.ignore_index = ignore_index
 
     def forward(self, logits, label, alpha=1, beta=1):
@@ -260,37 +263,9 @@ class SymmetricCrossEntropyLoss(nn.Module):
         label = rearrange(label, '1 l -> 1 l 1')
         logits = rearrange(logits, 'c l -> 1 c l 1')
 
-        loss = symmetric_cross_entropy(logits, label, alpha, beta)
+        loss = symmetric_cross_entropy(logits, label, self.num_classes, alpha, beta)
 
         return loss
-
-def validation(model, eval_loader):
-    model.eval()
-    pred_all = []
-    label_all = []
-    for inputs in eval_loader:
-        img, label = inputs    
-        img = img.cuda()
-        with torch.no_grad():
-            _, outputs = model(img)
-            outputs = outputs[0, :, :, :]
-        pred = outputs.data.max(0)[1].cpu()
-        pred_all.append(pred)
-        label_all.append(label)
-    pred_all = torch.stack(pred_all, dim=0)
-    label_all = torch.cat(label_all, dim=0)
-    score = DiceScore(pred_all, label_all, 7)
-
-    logx.msg('eval:')
-    logx.msg('Mean Dice: {}'.format(score['Mean Dice']))
-    logx.msg('Thalamus: {}'.format(score['Dice'][0]))
-    logx.msg('Caudate: {}'.format(score['Dice'][1]))
-    logx.msg('Putamen: {}'.format(score['Dice'][2]))
-    logx.msg('Pallidum: {}'.format(score['Dice'][3]))
-    logx.msg('Hippocampus: {}'.format(score['Dice'][4]))
-    logx.msg('Amygdala: {}'.format(score['Dice'][5]))
-
-    return score
 
 def eval(model, best_checkpoint, test_loader):
     checkpoint = torch.load(best_checkpoint)
@@ -388,22 +363,20 @@ def log_(score, score_mhd, phase = 'val', epoch=None):
     logx.metric(phase=phase, metrics=log, epoch=epoch)
 
 
-def train(model, D, MI, train_loader, num_iters, optimizer, optimizer_D, st_model,optimizer_st, criterion, config, epoch):#
+def train(model, D, MI, dataloader_s, dataloader_t, num_iters, optimizer, optimizer_D, st_model,optimizer_st, criterion, config, num_classes):#
     model.train()
     st_model.train()
     D.train()
-    loss_MI = DeepInfoMaxLoss(type="conv") #conv concat dot
-    train_iter = enumerate(train_loader)
-    for i in range(num_iters):
+    loss_MI = DeepInfoMaxLoss(num_classes, type="conv") #conv concat dot
+    for i, (data_s, data_t) in enumerate(zip(dataloader_s, dataloader_t)):
     # train segmentation network
         set_requires_grad(D, requires_grad=False)
         set_requires_grad(model, requires_grad=True)
         set_requires_grad(st_model, requires_grad=False)  
         model.zero_grad()
-        _, inputs = train_iter.__next__()
-        src_img, src_label, tgt_img = inputs[0].cuda(), inputs[1].cuda(), inputs[2].cuda()
+        src_img, src_label, tgt_img = data_s["image"].cuda(), data_s["label"].squeeze(1).cuda(), data_t["image"].cuda()
         src_fea, src_logits = model(src_img)
-        src_label_ = to_one(src_label, 7) # 4,7,96,128 to 4,1,96,128      
+        src_label_ = to_one(src_label, num_classes) # 4,7,96,128 to 4,1,96,128
         src_pos, src_neg = MI(src_fea,src_label_) #正负特征筛选
         src_logits = src_logits.div(config.t)
         loss_seg_src = F.cross_entropy(src_logits, src_label) + dice_loss(src_logits, src_label) #源域分割损失 
@@ -420,16 +393,16 @@ def train(model, D, MI, train_loader, num_iters, optimizer, optimizer_D, st_mode
             tgt_pseudo_label = tgt_logits_st.max(1).indices
             tgt_pseudo_label_ = tgt_pseudo_label.clone()               
             tgt_pseudo_label_[torch.where(mask)] = 255 
-            tgt_pseudo_label = to_one_hot(tgt_pseudo_label, 7) #0 1 编码
-            src_label = to_one_hot(src_label, 7)     
+            tgt_pseudo_label = to_one_hot(tgt_pseudo_label, num_classes) #0 1 编码
+            src_label = to_one_hot(src_label, num_classes)
        #教师模型对目标域输出
         tgt_fea_aug, tgt_logits_aug = model(tgt_img_aug) 
         tgt_pseudo_aug = tgt_logits_aug.max(1).indices  # 4,96,128
-        tgt_pseudo_ = to_one(tgt_pseudo_aug,7)      
+        tgt_pseudo_ = to_one(tgt_pseudo_aug,num_classes)
         tgt_pos, tgt_neg = MI(tgt_fea_aug, tgt_pseudo_) #正负特征筛选
         loss_seg_tgt = criterion(tgt_logits_aug, tgt_pseudo_label_, 0.5, 0.5) #学生模型结果对教师模型输出监督目标域分割损失
         loss_seg = loss_seg_src + 0.1*loss_seg_tgt  #教师模型一致性分割损失
-             
+
         loss_mu = 0.5*loss_MI(src_pos, src_neg, tgt_pos) + 0.5*loss_MI(src_neg, src_pos, tgt_neg) #教师模型互信息损失
         tgt_D_pred = D(tgt_fea_aug) #目标域域判别损失
         loss_adv_aug = config.lambda_adv * soft_label_cross_entropy(tgt_D_pred, torch.cat((tgt_pseudo_label, torch.zeros_like(tgt_pseudo_label)), dim=1))
@@ -454,11 +427,11 @@ def train(model, D, MI, train_loader, num_iters, optimizer, optimizer_D, st_mode
         set_requires_grad(st_model, requires_grad=True)       
         st_model.zero_grad()  
         tgt_fea_st, tgt_logits_st = st_model(tgt_img)
-        tgt_pseudo_label = to_one(tgt_logits_st.max(1).indices, 7) 
+        tgt_pseudo_label = to_one(tgt_logits_st.max(1).indices, num_classes)
         tgt_aug_fea, tgt_aug_logits = model(tgt_img_aug)  
         with torch.no_grad():                      
              tgt_pseudo_logits = tgt_aug_logits.max(1).indices #原模型生成伪标签
-             tgt_pseudo_src = to_one(tgt_pseudo_logits,7)           
+             tgt_pseudo_src = to_one(tgt_pseudo_logits,num_classes)
              mask = entropy_confidence_mask(tgt_aug_logits, 0.1)
              tgt_pseudo_logits[torch.where(mask)] = 255 
         loss_seg_st = criterion(tgt_logits_st, tgt_pseudo_logits, 0.5, 0.5) #一致性蒸馏损失
@@ -484,13 +457,13 @@ def main(config):
 
     if config.task == "pelvic":
         common_file = common_pelvic
-        dataset_s = common_pelvic.Dataset(config.data_dir, "ct", n_slices=3, debug=config.debug)
-        dataset_t = common_pelvic.Dataset(config.data_dir, "cbct", n_slices=3, debug=config.debug)
+        dataset_s = common_pelvic.Dataset(config.data_dir, "ct", n_slices=1, debug=config.debug)
+        dataset_t = common_pelvic.Dataset(config.data_dir, "cbct", n_slices=1, debug=config.debug)
         _, val_data, _, val_label = common_pelvic.load_val_data(config.data_dir)
     elif config.task == "amos":
         common_file = common_amos
-        dataset_s = common_amos.Dataset(config.data_dir, modality="ct", n_slices=3, debug=config.debug)
-        dataset_t = common_ixi.Dataset(config.data_dir, modality="mr", n_slices=3, debug=config.debug)
+        dataset_s = common_amos.Dataset(config.data_dir, modality="ct", n_slices=1, debug=config.debug)
+        dataset_t = common_ixi.Dataset(config.data_dir, modality="mr", n_slices=1, debug=config.debug)
         _, val_data, _, val_label = common_amos.load_test_data(config.data_dir, "val")
     else:
         assert 0
@@ -500,24 +473,21 @@ def main(config):
         val_label = val_label[:1]
 
     patch_shape = (1, dataset_s.patch_height, dataset_s.patch_width)
-    dataloader_s = torch.utils.data.DataLoader(dataset_s, batch_size=config.batch_size, shuffle=True, pin_memory=True, drop_last=True)
-    dataloader_t = torch.utils.data.DataLoader(dataset_t, batch_size=config.batch_size, shuffle=True, pin_memory=True, drop_last=True)
+    dataloader_s = torch.utils.data.DataLoader(dataset_s, batch_size=config.batch_size, shuffle=True, pin_memory=True,
+                                               drop_last=True)
+    dataloader_t = torch.utils.data.DataLoader(dataset_t, batch_size=config.batch_size, shuffle=True, pin_memory=True,
+                                               drop_last=True)
 
-    model = U_Net_4(num_classes=common_file.NUM_CLASSES).cuda()
+    model = U_Net_4(1, num_classes=common_file.NUM_CLASSES).cuda()
     D = PixelDiscriminator_(64, num_classes=common_file.NUM_CLASSES).cuda()
     #D = PixelDiscriminator(7).cuda()
-    st_model = U_Net_4(num_classes=common_file.NUM_CLASSES).cuda()
-    MI = PosNeg(64, num_classes=common_file.NUM_CLASSE).cuda()
+    st_model = U_Net_4(1, num_classes=common_file.NUM_CLASSES).cuda()
+    MI = PosNeg(64, num_classes=common_file.NUM_CLASSES).cuda()
 
     checkpoint = torch.load(config.checkpoint) #预训练模型
     model.load_state_dict(checkpoint['model_state_dict'])
     st_model.load_state_dict(checkpoint['model_state_dict'])
 
-    train_dataset, eval_dataset, test_dataset = build_dataset_DA_ca(TRAIN_CONFIG, model, random_flip_rotate)#build_dataset_DA_ca
-    train_loader = data.DataLoader(train_dataset, batch_size=4, num_workers=1, shuffle=True)
-    #test_loader = data.DataLoader(test_dataset, batch_size=1, num_workers=1, shuffle=False)
-    eval_loader  = data.DataLoader(eval_dataset, batch_size=1, num_workers=1, shuffle=False)
-    
     #eval 分割可视化
     #seg_checkpoint = torch.load(config.seg_checkpoint)
     #segout_IBSR(st_model, checkpoint, eval_loader)
@@ -532,28 +502,32 @@ def main(config):
     scheduler_st = StepLR(optimizer_st, step_size=config.step_size, gamma=config.gamma)
     scheduler_D = LambdaLR(optimizer_D, lr_lambda=lr_decay_function)
 
-    criterion = Criterion(7)
+    criterion = Criterion(common_file.NUM_CLASSES)
     t_start = time.time()
 
+    best_dsc = 0
     for epoch in range(config.n_epochs):
         logx.msg('epoch: {}'.format(epoch))        
         t_epoch = time.time()
-        train(model, D, MI, train_loader, config.num_iters, optimizer, optimizer_D, st_model,optimizer_st, criterion, config, epoch) #
+        train(model, D, MI, dataloader_s, dataloader_t, config.num_iters, optimizer, optimizer_D, st_model,optimizer_st, criterion, config, common_file.NUM_CLASSES) #
         scheduler.step()
         scheduler_st.step()
         scheduler_D.step()
         t_train = time.time()
         logx.msg('cost {:.2f} seconds in this train epoch'.format(t_train - t_epoch))
-        score_eval = validation(st_model, eval_loader)
-        validation(model, eval_loader)
-        save_dict = {
-             'st_model_state_dict':st_model.state_dict(),
-             'model_state_dict':model.state_dict(),
-             'D_state_dict':D.state_dict(),
-             'MI_state_dict':MI.state_dict()
-        }
-        logx.save_model(save_dict, metric=score_eval['Mean Dice'], epoch=epoch, higher_better=True)
+        val_dsc = ADA_native.validation(st_model, patch_shape, val_data, val_label, common_file.NUM_CLASSES)
+        if val_dsc.mean() > best_dsc:
+            best_dsc = val_dsc.mean()
+            save_dict = {
+                 'st_model_state_dict':st_model.state_dict(),
+                 'model_state_dict':model.state_dict(),
+                 'D_state_dict':D.state_dict(),
+                 'MI_state_dict':MI.state_dict()
+            }
+            logx.save_model(save_dict, metric=val_dsc.mean(), epoch="best", higher_better=True)
 
+        logx.msg('Epoch %d  val_dsc: %.4f  best_dsc: %.4f' % (epoch, val_dsc.mean(), best_dsc))
+    """
     best_checkpoint = logx.get_best_checkpoint()
 
      #test_loader
@@ -561,6 +535,7 @@ def main(config):
 
     t_end = time.time()
     logx.msg('cost {:.2f} minutes in this train epoch'.format((t_end - t_start) / 60))
+    """
 
 
 if __name__ == '__main__':
